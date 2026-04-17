@@ -1,4 +1,6 @@
 import esbuild from "esbuild";
+import fs from "fs/promises";
+import path from "path";
 import process from "process";
 import builtins from "builtin-modules";
 
@@ -10,6 +12,15 @@ if you want to view the source, please visit the github repository of this plugi
 `;
 
 const prod = (process.argv[2] === "production");
+const outdir = "dist";
+
+async function copyStaticFiles() {
+	await fs.mkdir(outdir, { recursive: true });
+	await Promise.all([
+		fs.copyFile("manifest.json", path.join(outdir, "manifest.json")),
+		fs.copyFile("styles.css", path.join(outdir, "styles.css")),
+	]);
+}
 
 const context = await esbuild.context({
 	banner: {
@@ -37,12 +48,14 @@ const context = await esbuild.context({
 	logLevel: "info",
 	sourcemap: prod ? false : "inline",
 	treeShaking: true,
-	outfile: "main.js",
+	outfile: path.join(outdir, "main.js"),
 });
 
 if (prod) {
 	await context.rebuild();
+	await copyStaticFiles();
 	process.exit(0);
 } else {
+	await copyStaticFiles();
 	await context.watch();
 }
