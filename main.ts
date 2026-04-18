@@ -29,6 +29,18 @@ interface ConfluencePage {
 	};
 }
 
+interface ConfluenceAttachment {
+	id: string;
+	title: string;
+	version?: {
+		number: number;
+	};
+	_links?: {
+		download?: string;
+		base?: string;
+	};
+}
+
 const DEFAULT_SETTINGS: ObsidianConfluenceSyncSettings = {
 	confluenceHost: '',
 	personalAccessToken: '',
@@ -38,8 +50,8 @@ const DEFAULT_SETTINGS: ObsidianConfluenceSyncSettings = {
 	mapping: {}
 };
 
-const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'bmp', 'svg', 'webp']);
 const FRONTMATTER_REGEX = /^---\r?\n[\s\S]*?\r?\n---\r?\n?/;
+const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'bmp', 'svg', 'webp']);
 
 export default class ObsidianConfluenceSync extends Plugin {
 	settings: ObsidianConfluenceSyncSettings;
@@ -128,10 +140,10 @@ export default class ObsidianConfluenceSync extends Plugin {
 			const page = await this.ensureConfluencePage(uniqueId, activeFile.basename);
 			const rawContent = await this.app.vault.read(activeFile);
 			const sanitizedContent = this.stripFrontmatter(rawContent);
-			const imageUpload = await this.uploadImagesAndRewriteContent(activeFile, sanitizedContent, page.id);
+			const attachmentUpload = await this.uploadAttachmentsAndRewriteContent(activeFile, sanitizedContent, page.id);
 
 			new Notice('Syncing to Confluence...');
-			const syncedPage = await this.syncContentsToConfluence(page.id, imageUpload.content, activeFile.basename);
+			const syncedPage = await this.syncContentsToConfluence(page.id, attachmentUpload.content, activeFile.basename);
 
 			this.settings.mapping[uniqueId] = syncedPage.id;
 			await this.saveSettings();
@@ -142,8 +154,8 @@ export default class ObsidianConfluenceSync extends Plugin {
 				`Unique ID: ${uniqueId}`,
 				`Resolved pageId: ${page.id}`,
 				`Synced pageId: ${syncedPage.id}`,
-				`Uploaded attachments: ${imageUpload.uploadedCount}`,
-				`Skipped attachments: ${imageUpload.skippedCount}`,
+				`Uploaded attachments: ${attachmentUpload.uploadedCount}`,
+				`Skipped attachments: ${attachmentUpload.skippedCount}`,
 				`Confluence URL: ${this.getConfluencePageUrl(syncedPage)}`
 			]);
 
@@ -502,7 +514,7 @@ export default class ObsidianConfluenceSync extends Plugin {
 		return `<ac:structured-macro ac:name="markdown" ac:schema-version="1"><ac:plain-text-body><![CDATA[${safeMarkdown}]]></ac:plain-text-body></ac:structured-macro>`;
 	}
 
-	async uploadImagesAndRewriteContent(
+	async uploadAttachmentsAndRewriteContent(
 		activeFile: TFile,
 		content: string,
 		pageId: string
@@ -510,52 +522,31 @@ export default class ObsidianConfluenceSync extends Plugin {
 		let rewrittenContent = content;
 		let uploadedCount = 0;
 		let skippedCount = 0;
-		const wikiImageMatches = Array.from(rewrittenContent.matchAll(/!\[\[([^\]]+)\]\]/g));
+		const wikiAttachmentMatches = Array.from(rewrittenContent.matchAll(/!\[\[([^\]]+)\]\]/g));
 
-		for (const match of wikiImageMatches) {
+		// 获取 Confluence 页面上现有的附件列表
+		const existingAttachments = await this.getExistingAttachments(pageId);
+
+		for (const match of wikiAttachmentMatches) {
 			const fullMatch = match[0];
 			const rawTarget = match[1];
 			const segments = rawTarget.split('|').map((item) => item.trim());
-			const imagePath = segments[0];
-			const altText = segments.slice(1).join(' ') || imagePath;
-			const file = this.resolveFile(activeFile, imagePath);
+			const attachmentPath = segments[0];
+			const altText = segments.slice(1).join(' ') || attachmentPath;
+			const file = this.resolveFile(activeFile, attachmentPath);
 
-			if (!file || !this.isImageFile(file)) {
+			if (!file) {
 				continue;
 			}
 
 			try {
-				const imageUrl = await this.uploadAttachmentAndGetUrl(pageId, file);
-				rewrittenContent = rewrittenContent.replace(fullMatch, `![${altText}](${imageUrl})`);
-				uploadedCount += 1;
-			} catch (error) {
-				skippedCount += 1;
-				this.appendLastSyncDebugInfo([
-					`Attachment upload skipped: ${file.name}`,
-					`Attachment error: ${this.formatConfluenceError(error)}`
-				]);
-			}
-		}
-
-		const markdownImageMatches = Array.from(rewrittenContent.matchAll(/!\[([^\]]*)\]\(([^)]+)\)/g));
-
-		for (const match of markdownImageMatches) {
-			const fullMatch = match[0];
-			const altText = match[1];
-			const imageTarget = this.normalizeMarkdownTarget(match[2]);
-
-			if (this.isRemoteUrl(imageTarget)) {
-				continue;
-			}
-
-			const file = this.resolveFile(activeFile, imageTarget);
-			if (!file || !this.isImageFile(file)) {
-				continue;
-			}
-
-			try {
-				const imageUrl = await this.uploadAttachmentAndGetUrl(pageId, file);
-				rewrittenContent = rewrittenContent.replace(fullMatch, `![${altText || file.basename}](${imageUrl})`);
+				const attachmentUrl = await this.uploadAttachmentAndGetUrl(pageId, file, existingAttachments);
+				// 图片使用 ![]() 格式，其他附件使用 []() 格式
+				if (this.isImageFile(file)) {
+					rewrittenContent = rewrittenContent.replace(fullMatch, `![${altText}](${attachmentUrl})`);
+				} else {
+					rewrittenContent = rewrittenContent.replace(fullMatch, `[${altText}](${attachmentUrl})`);
+				}
 				uploadedCount += 1;
 			} catch (error) {
 				skippedCount += 1;
@@ -605,20 +596,81 @@ export default class ObsidianConfluenceSync extends Plugin {
 		return target.trim().replace(/^<|>$/g, '');
 	}
 
-	async uploadAttachmentAndGetUrl(pageId: string, file: TFile): Promise<string> {
+	async getExistingAttachments(pageId: string): Promise<Map<string, ConfluenceAttachment>> {
+		const attachmentsMap = new Map<string, ConfluenceAttachment>();
+
+		try {
+			const response = await this.requestConfluence({
+				url: `${this.getConfluenceHost()}/rest/api/content/${pageId}/child/attachment?expand=version&limit=100`,
+				method: 'GET',
+				headers: this.getConfluenceHeaders()
+			}, `Get existing attachments for page ${pageId}`);
+
+			const attachmentData = response.json as {
+				results?: Array<{
+					title: string;
+					id: string;
+					version?: { number: number };
+					_links?: { download?: string; base?: string };
+				}>;
+			};
+
+			if (attachmentData.results) {
+				for (const attachment of attachmentData.results) {
+					attachmentsMap.set(attachment.title, {
+						id: attachment.id,
+						title: attachment.title,
+						version: attachment.version,
+						_links: attachment._links
+					});
+				}
+			}
+		} catch (error) {
+			this.appendLastSyncDebugInfo([
+				`Failed to get existing attachments: ${this.formatConfluenceError(error)}`
+			]);
+		}
+
+		return attachmentsMap;
+	}
+
+	async uploadAttachmentAndGetUrl(pageId: string, file: TFile, existingAttachments: Map<string, ConfluenceAttachment>): Promise<string> {
+		const existingAttachment = existingAttachments.get(file.name);
+
+		// 如果附件已存在，跳过上传（避免重复）
+		if (existingAttachment) {
+			this.appendLastSyncDebugInfo([
+				`Attachment skipped (already exists): ${file.name} (id: ${existingAttachment.id})`
+			]);
+			return this.getAttachmentUrl(pageId, file.name, existingAttachment);
+		}
+
+		// 上传新文件
+		return this.performUpload(pageId, file, false);
+	}
+
+	async performUpload(pageId: string, file: TFile, isUpdate: boolean): Promise<string> {
 		const fileContents = await this.app.vault.adapter.readBinary(file.path);
 		const mimeType = this.getMimeType(file.extension);
 		const multipart = this.buildMultipartBody(file.name, mimeType, fileContents);
 
+		// 更新附件需要使用特定的 URL
+		const url = isUpdate
+			? `${this.getConfluenceHost()}/rest/api/content/${pageId}/child/attachment/${encodeURIComponent(file.name)}/data`
+			: `${this.getConfluenceHost()}/rest/api/content/${pageId}/child/attachment`;
+
+		const method = isUpdate ? 'PUT' : 'POST';
+		const action = isUpdate ? `Update attachment ${file.name}` : `Upload attachment ${file.name}`;
+
 		this.appendLastSyncDebugInfo([
-			`Request: Upload attachment ${file.name} to page ${pageId}`,
-			'Method: POST',
-			`URL: ${this.getConfluenceHost()}/rest/api/content/${pageId}/child/attachment`
+			`Request: ${action} to page ${pageId}`,
+			'Method: ' + method,
+			`URL: ${url}`
 		]);
 
 		const response = await this.sendBinaryRequest({
-			url: `${this.getConfluenceHost()}/rest/api/content/${pageId}/child/attachment`,
-			method: 'POST',
+			url: url,
+			method: method,
 			headers: {
 				Accept: 'application/json',
 				Authorization: this.getAuthorizationHeader(),
@@ -627,7 +679,8 @@ export default class ObsidianConfluenceSync extends Plugin {
 				'X-Atlassian-Token': 'no-check'
 			},
 			body: multipart.body
-		}, `Upload attachment ${file.name} to page ${pageId}`);
+		}, action);
+
 		const attachmentResponse = JSON.parse(response.text) as {
 			results?: Array<{
 				_links?: {
@@ -644,6 +697,17 @@ export default class ObsidianConfluenceSync extends Plugin {
 		}
 
 		return `${this.getConfluenceHost()}/download/attachments/${pageId}/${encodeURIComponent(file.name)}`;
+	}
+
+	getAttachmentUrl(pageId: string, filename: string, attachment: ConfluenceAttachment): string {
+		const downloadPath = attachment._links?.download;
+		const downloadBase = attachment._links?.base ?? this.getConfluenceHost();
+
+		if (downloadPath) {
+			return `${downloadBase}${downloadPath}`;
+		}
+
+		return `${this.getConfluenceHost()}/download/attachments/${pageId}/${encodeURIComponent(filename)}`;
 	}
 
 	buildMultipartBody(filename: string, mimeType: string, binaryContents: ArrayBuffer): { body: Buffer; boundary: string } {
