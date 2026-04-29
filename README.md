@@ -6,10 +6,15 @@ Sync Obsidian notes to Confluence 5.9.9+.
 
 The plugin supports two sync modes:
 
-- If the current note already has a bound Confluence page ID, sync overwrites that page.
+- If the current note already has a bound Confluence page ID in frontmatter, sync overwrites that page.
 - If the note has no binding, the plugin creates a new child page under the configured parent page, syncs the note, and stores the new page ID for later updates.
 
-Each note gets a `uniqueId` in frontmatter so the Confluence binding survives file moves or renames. After a successful sync, the plugin also writes `confluenceUrl` back to frontmatter.
+Each note stores its own binding in frontmatter. By default the plugin writes:
+
+- `confluencePageId`: the Confluence page ID used for syncing
+- `wiki`: the Confluence page URL for convenient direct use elsewhere
+
+Both field names are configurable in plugin settings. Older notes that still use `uniqueId` + plugin `mapping` are migrated lazily the next time they are synced.
 
 ## Required Settings
 

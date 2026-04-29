@@ -1,7 +1,6 @@
 import * as http from 'http';
 import * as https from 'https';
 import { App, Modal, Notice, Plugin, PluginSettingTab, RequestUrlParam, RequestUrlResponse, Setting, TFile, requestUrl } from 'obsidian';
-import { v4 as uuidv4 } from 'uuid';
 
 interface ObsidianConfluenceSyncSettings {
 	confluenceHost: string;
@@ -9,7 +8,9 @@ interface ObsidianConfluenceSyncSettings {
 	username: string;
 	password: string;
 	parentPageId: string;
-	mapping: { [key: string]: string };
+	pageIdFieldName: string;
+	wikiFieldName: string;
+	mapping?: { [key: string]: string };
 }
 
 interface ConfluencePage {
@@ -47,6 +48,8 @@ const DEFAULT_SETTINGS: ObsidianConfluenceSyncSettings = {
 	username: '',
 	password: '',
 	parentPageId: '',
+	pageIdFieldName: 'confluencePageId',
+	wikiFieldName: 'wiki',
 	mapping: {}
 };
 
@@ -80,10 +83,18 @@ export default class ObsidianConfluenceSync extends Plugin {
 						return;
 					}
 
-					const uniqueId = await this.createOrGetUniqueId(activeFile);
-					this.settings.mapping[uniqueId] = result.trim();
-					await this.saveSettings();
-					new Notice('Confluence page mapping saved.');
+					const pageId = this.extractConfluencePageId(result);
+					if (!pageId) {
+						new Notice('Enter a valid Confluence page ID or URL.');
+						return;
+					}
+
+					const wikiUrl = this.extractConfluencePageUrl(result, pageId);
+					await this.updateNoteProperties(activeFile, {
+						id: pageId,
+						wikiUrl
+					});
+					new Notice('Confluence page connection saved.');
 				}).open();
 			}
 		});
@@ -112,6 +123,8 @@ export default class ObsidianConfluenceSync extends Plugin {
 
 	async loadSettings() {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+		this.settings.pageIdFieldName = this.normalizeFrontmatterFieldName(this.settings.pageIdFieldName, DEFAULT_SETTINGS.pageIdFieldName);
+		this.settings.wikiFieldName = this.normalizeFrontmatterFieldName(this.settings.wikiFieldName, DEFAULT_SETTINGS.wikiFieldName);
 	}
 
 	async saveSettings() {
@@ -126,18 +139,20 @@ export default class ObsidianConfluenceSync extends Plugin {
 		}
 
 		try {
-			const uniqueId = await this.createOrGetUniqueId(activeFile);
+			const pageBinding = await this.getOrMigratePageBinding(activeFile);
+			const boundPageId = pageBinding?.pageId?.trim() ?? '';
 			this.setLastSyncDebugInfo([
 				'Status: starting',
 				`File: ${activeFile.path}`,
 				`Title: ${activeFile.basename}`,
-				`Unique ID: ${uniqueId}`,
 				`Configured host: ${this.settings.confluenceHost || '(empty)'}`,
 				`Configured parentPageId: ${this.settings.parentPageId || '(empty)'}`,
-				`Mapped pageId: ${this.settings.mapping[uniqueId] || '(empty)'}`,
+				`Page ID field: ${this.settings.pageIdFieldName}`,
+				`Wiki field: ${this.settings.wikiFieldName}`,
+				`Mapped pageId: ${boundPageId || '(empty)'}`,
 				`Auth mode: ${this.getAuthMode()}`
 			]);
-			const page = await this.ensureConfluencePage(uniqueId, activeFile.basename);
+			const page = await this.ensureConfluencePage(boundPageId, activeFile.basename);
 			const rawContent = await this.app.vault.read(activeFile);
 			const sanitizedContent = this.stripFrontmatter(rawContent);
 			const attachmentUpload = await this.uploadAttachmentsAndRewriteContent(activeFile, sanitizedContent, page.id);
@@ -145,13 +160,10 @@ export default class ObsidianConfluenceSync extends Plugin {
 			new Notice('Syncing to Confluence...');
 			const syncedPage = await this.syncContentsToConfluence(page.id, attachmentUpload.content, activeFile.basename);
 
-			this.settings.mapping[uniqueId] = syncedPage.id;
-			await this.saveSettings();
 			await this.updateNoteProperties(activeFile, syncedPage);
 			this.setLastSyncDebugInfo([
 				'Status: success',
 				`File: ${activeFile.path}`,
-				`Unique ID: ${uniqueId}`,
 				`Resolved pageId: ${page.id}`,
 				`Synced pageId: ${syncedPage.id}`,
 				`Uploaded attachments: ${attachmentUpload.uploadedCount}`,
@@ -308,31 +320,61 @@ export default class ObsidianConfluenceSync extends Plugin {
 		}
 	}
 
-	createOrGetUniqueId = async (activeFile: TFile): Promise<string> => {
-		let uniqueId = '';
+	async getOrMigratePageBinding(activeFile: TFile): Promise<{ pageId: string; wikiUrl: string } | null> {
 		const frontmatter = this.app.metadataCache.getFileCache(activeFile)?.frontmatter;
-
-		if (frontmatter && frontmatter.uniqueId) {
-			uniqueId = frontmatter.uniqueId;
-		} else {
-			uniqueId = this.generateUniqueID();
-			await this.app.fileManager.processFrontMatter(activeFile, (fileFrontmatter) => {
-				fileFrontmatter.uniqueId = uniqueId;
-			});
+		const directPageId = this.readFrontmatterValue(frontmatter, this.settings.pageIdFieldName);
+		if (directPageId) {
+			return {
+				pageId: directPageId,
+				wikiUrl: this.readFrontmatterValue(frontmatter, this.settings.wikiFieldName)
+			};
 		}
 
-		return uniqueId;
+		const legacyUniqueId = this.readFrontmatterValue(frontmatter, 'uniqueId');
+		const legacyPageId = legacyUniqueId ? this.settings.mapping?.[legacyUniqueId]?.trim() ?? '' : '';
+		if (!legacyPageId) {
+			return null;
+		}
+
+		const wikiUrl = this.buildConfluencePageUrl(legacyPageId);
+		await this.app.fileManager.processFrontMatter(activeFile, (fileFrontmatter) => {
+			fileFrontmatter[this.settings.pageIdFieldName] = legacyPageId;
+			fileFrontmatter[this.settings.wikiFieldName] = wikiUrl;
+			delete fileFrontmatter.uniqueId;
+		});
+
+		if (legacyUniqueId && this.settings.mapping) {
+			delete this.settings.mapping[legacyUniqueId];
+			await this.saveSettings();
+		}
+
+		return {
+			pageId: legacyPageId,
+			wikiUrl
+		};
 	}
 
-	async ensureConfluencePage(uniqueId: string, title: string): Promise<ConfluencePage> {
-		const mappedPageId = this.settings.mapping[uniqueId]?.trim();
-		if (mappedPageId) {
-			return this.getContentFromConfluence(mappedPageId);
+	readFrontmatterValue(frontmatter: Record<string, unknown> | undefined, fieldName: string): string {
+		const value = frontmatter?.[fieldName];
+		if (typeof value === 'string') {
+			return value.trim();
+		}
+
+		if (typeof value === 'number') {
+			return String(value);
+		}
+
+		return '';
+	}
+
+	async ensureConfluencePage(pageId: string, title: string): Promise<ConfluencePage> {
+		if (pageId) {
+			return this.getContentFromConfluence(pageId);
 		}
 
 		const parentPageId = this.settings.parentPageId.trim();
 		if (!parentPageId) {
-			throw new Error('No mapped page found and no parent page ID configured.');
+			throw new Error('No bound page found and no parent page ID configured.');
 		}
 
 		return this.createChildPage(title, parentPageId);
@@ -792,15 +834,16 @@ export default class ObsidianConfluenceSync extends Plugin {
 		}
 	}
 
-	async updateNoteProperties(activeFile: TFile, page: ConfluencePage): Promise<void> {
-		const confluenceUrl = this.getConfluencePageUrl(page);
+	async updateNoteProperties(activeFile: TFile, page: ConfluencePage | { id: string; wikiUrl?: string }): Promise<void> {
+		const wikiUrl = 'wikiUrl' in page && page.wikiUrl ? page.wikiUrl : this.getConfluencePageUrl(page);
 
 		await this.app.fileManager.processFrontMatter(activeFile, (frontmatter) => {
-			frontmatter.confluenceUrl = confluenceUrl;
+			frontmatter[this.settings.pageIdFieldName] = page.id;
+			frontmatter[this.settings.wikiFieldName] = wikiUrl;
 		});
 	}
 
-	getConfluencePageUrl(page: ConfluencePage): string {
+	getConfluencePageUrl(page: ConfluencePage | { id: string; _links?: { base?: string; webui?: string } }): string {
 		const webUi = page._links?.webui;
 		const base = page._links?.base ?? this.getConfluenceHost();
 
@@ -808,11 +851,43 @@ export default class ObsidianConfluenceSync extends Plugin {
 			return `${base}${webUi}`;
 		}
 
-		return `${this.getConfluenceHost()}/pages/viewpage.action?pageId=${page.id}`;
+		return this.buildConfluencePageUrl(page.id);
 	}
 
-	generateUniqueID(): string {
-		return uuidv4();
+	buildConfluencePageUrl(pageId: string): string {
+		return `${this.getConfluenceHost()}/pages/viewpage.action?pageId=${pageId}`;
+	}
+
+	normalizeFrontmatterFieldName(fieldName: string | undefined, fallback: string): string {
+		const normalized = fieldName?.trim();
+		return normalized || fallback;
+	}
+
+	extractConfluencePageId(value: string): string {
+		const trimmedValue = value.trim();
+		if (!trimmedValue) {
+			return '';
+		}
+
+		if (/^\d+$/.test(trimmedValue)) {
+			return trimmedValue;
+		}
+
+		const urlMatch = trimmedValue.match(/[?&]pageId=(\d+)/i);
+		if (urlMatch) {
+			return urlMatch[1];
+		}
+
+		return '';
+	}
+
+	extractConfluencePageUrl(value: string, pageId: string): string {
+		const trimmedValue = value.trim();
+		if (/^https?:\/\//i.test(trimmedValue)) {
+			return trimmedValue;
+		}
+
+		return this.buildConfluencePageUrl(pageId);
 	}
 }
 
@@ -831,10 +906,10 @@ class CreateNewConnectionModal extends Modal {
 		contentEl.createEl('h1', { text: 'Create new Confluence connection' });
 
 		new Setting(contentEl)
-			.setName('Confluence page ID')
-			.setDesc('Enter an existing Confluence page ID to bind this note.')
+			.setName('Confluence page ID or URL')
+			.setDesc('Enter an existing Confluence page ID or full page URL to bind this note.')
 			.addText((text) =>
-				text.setPlaceholder('123456').onChange((value) => {
+				text.setPlaceholder('123456 or https://wiki.example.com/pages/viewpage.action?pageId=123456').onChange((value) => {
 					this.result = value;
 				})
 			);
@@ -944,11 +1019,31 @@ class ObsidianConfluenceSyncSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
-			.setName('Personal Access Token')
-			.setDesc('Optional Bearer token fallback for newer Confluence servers')
+			.setName('Confluence page ID field')
+			.setDesc('Frontmatter field used to store the Confluence page ID.')
 			.addText((text) =>
-				text.setPlaceholder('Personal Access Token').setValue(this.plugin.settings.personalAccessToken).onChange(async (value) => {
-					this.plugin.settings.personalAccessToken = value.trim();
+				text.setPlaceholder('confluencePageId').setValue(this.plugin.settings.pageIdFieldName).onChange(async (value) => {
+					const normalized = this.plugin.normalizeFrontmatterFieldName(value, DEFAULT_SETTINGS.pageIdFieldName);
+					if (normalized === this.plugin.settings.wikiFieldName) {
+						new Notice('Page ID field and wiki field must be different.');
+						return;
+					}
+					this.plugin.settings.pageIdFieldName = normalized;
+					await this.plugin.saveSettings();
+				})
+			);
+
+		new Setting(containerEl)
+			.setName('Wiki field')
+			.setDesc('Frontmatter field used to store the Confluence page URL.')
+			.addText((text) =>
+				text.setPlaceholder('wiki').setValue(this.plugin.settings.wikiFieldName).onChange(async (value) => {
+					const normalized = this.plugin.normalizeFrontmatterFieldName(value, DEFAULT_SETTINGS.wikiFieldName);
+					if (normalized === this.plugin.settings.pageIdFieldName) {
+						new Notice('Page ID field and wiki field must be different.');
+						return;
+					}
+					this.plugin.settings.wikiFieldName = normalized;
 					await this.plugin.saveSettings();
 				})
 			);
