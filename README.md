@@ -30,13 +30,77 @@ Configure these values in the plugin settings:
 ## Commands
 
 - `Sync contents of current page to Confluence`: create-or-update sync for the active note
+- `Sync attachments of current page`: sync attachments only, optionally rewrite note links, and optionally delete local files after successful S3 upload
 - `Create new Confluence connection`: manually bind the active note to an existing Confluence page ID
 - `Show last Confluence sync debug info`
 - `Copy last Confluence sync debug info`
 
 ## Attachments
 
-The plugin uploads local attachments to the target Confluence page and rewrites note links to Confluence attachment URLs.
+The plugin uploads local attachments to the target Confluence page and rewrites note links to Confluence attachment URLs by default.
+
+It also supports routing selected attachments to S3-compatible storage such as MinIO, OSS (S3-compatible endpoint), and RustFS.
+
+### Attachment Sync Modes
+
+- `wiki` (default): all processed attachments keep the current Confluence upload behavior
+- `s3`: only attachments whose **filenames** match configured patterns are uploaded to S3-compatible storage and rewritten to remote URLs; all other attachments still go to Confluence
+
+### S3-Compatible Attachment Settings
+
+The settings tab includes:
+
+- `Attachment mode`
+- `Attachment file patterns`
+- `Path template`
+- `Project field name`
+- `Default project`
+- `Replace links when S3 upload succeeds`
+- `Delete local files after upload`
+- `S3 endpoint`
+- `S3 region`
+- `S3 bucket`
+- `S3 access key`
+- `S3 secret key`
+- `Force path style`
+- `Public base URL`
+
+### Pattern Matching
+
+Attachment filtering is **filename-only** and supports `*` wildcard matching:
+
+- `*.log`
+- `*.log.gz`
+- `*.tgz`
+
+Patterns can be separated by commas or new lines.
+
+### Path Template Variables
+
+The S3 object key template supports:
+
+- `{project}`
+- `{yyyy}`
+- `{MM}`
+- `{dd}`
+- `{filename}`
+
+Example:
+
+```text
+{project}/{yyyy}/{MM}/{dd}/{filename}
+```
+
+If a note does not define the configured project frontmatter field, the plugin falls back to `Default project`.
+
+### Link Rewriting And Local Deletion
+
+- S3 uploads rewrite note links to the generated remote URL when `Replace links when S3 upload succeeds` is enabled
+- Local files are deleted only when all of these are true:
+  - S3 upload succeeded
+  - note link rewrite succeeded
+  - note save succeeded
+  - `Delete local files after upload` is enabled
 
 ### Supported File Types
 
