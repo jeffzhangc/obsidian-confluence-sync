@@ -113,18 +113,23 @@ All file types are supported:
 
 ### Link Format
 
-Only Obsidian internal link format is processed:
+Obsidian internal embeds and standard Markdown images are processed:
 
 ```markdown
 ![[document.pdf]]
 ![[archive.zip]]
 ![[image.png]]
+![Local image](assets/image.png)
+![Remote image](https://example.com/image.png)
 ```
 
 - **Images** are converted to `![alt](url)` format (displayed inline)
 - **Other files** are converted to `[filename](url)` format (download link)
+- Local Markdown images are uploaded before page sync
+- Remote `http/https` Markdown images are downloaded first, then uploaded to Confluence
+- Remote images that fail due to network or auth limits are skipped and recorded in debug info
 
-Standard Markdown image links `![alt](path)` are not processed to avoid external URL conflicts.
+Standard Markdown links like `[text](path)` are still not processed.
 
 ### Duplicate Detection
 

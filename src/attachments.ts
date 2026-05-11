@@ -1,15 +1,18 @@
-import { TFile } from 'obsidian';
-import { IMAGE_EXTENSIONS, WIKI_ATTACHMENT_REGEX } from './constants';
+import { requestUrl, TFile } from 'obsidian';
+import { IMAGE_EXTENSIONS, MARKDOWN_IMAGE_REGEX, WIKI_ATTACHMENT_REGEX } from './constants';
 import { readFrontmatterValue } from './frontmatter';
 import { ConfluenceAttachment, ConfluenceService } from './confluence';
 import { S3Service } from './s3';
 import { ObsidianConfluenceSyncSettings } from './settings';
 
 export interface AttachmentReference {
+	kind: 'wiki' | 'markdown-image';
 	fullMatch: string;
 	rawTarget: string;
 	attachmentPath: string;
 	altText: string;
+	index: number;
+	occurrence: number;
 }
 
 export interface AttachmentSyncCandidate {
@@ -18,6 +21,12 @@ export interface AttachmentSyncCandidate {
 	target: 'wiki' | 's3';
 	matchedPattern: string | null;
 	objectKey: string;
+}
+
+export interface RemoteImageResource {
+	filename: string;
+	mimeType: string;
+	binaryContents: ArrayBuffer;
 }
 
 export interface AttachmentSyncRunResult {
@@ -63,36 +72,55 @@ export class AttachmentSyncService {
 		this.appendDebugInfo([`Attachment references found: ${references.length}`]);
 
 		for (const reference of references) {
-			const file = this.resolveFile(activeFile, reference.attachmentPath);
-			if (!file) {
-				skippedCount += 1;
-				errors.push(`Missing attachment: ${reference.attachmentPath}`);
-				this.appendDebugInfo([`Attachment skipped: ${reference.attachmentPath}`, 'Reason: file could not be resolved']);
-				continue;
-			}
-
-			const candidate = this.buildAttachmentSyncCandidate(activeFile, reference, file);
-			this.appendDebugInfo([
-				`Attachment found: ${file.path}`,
-				`Attachment target: ${candidate.target}`,
-				`Attachment pattern: ${candidate.matchedPattern ?? '(none)'}`,
-				`Attachment object key: ${candidate.objectKey || '(n/a)'}`
-			]);
-
-			if (candidate.target === 'wiki' && !pageId) {
-				throw new Error(`Attachment ${file.name} requires a bound Confluence page before it can sync to wiki.`);
-			}
-
 			try {
+				if (this.isRemoteImageReference(reference)) {
+					if (!pageId) {
+						throw new Error(`Remote image ${reference.attachmentPath} requires a bound Confluence page before it can sync to wiki.`);
+					}
+					const remoteImage = await this.downloadRemoteImage(reference.attachmentPath);
+					this.appendDebugInfo([
+						`Remote image downloaded: ${reference.attachmentPath}`,
+						`Remote image filename: ${remoteImage.filename}`,
+						`Remote image mime type: ${remoteImage.mimeType}`
+					]);
+					const url = await this.confluenceService.uploadBinaryAttachmentAndGetUrl(pageId, remoteImage.filename, remoteImage.mimeType, remoteImage.binaryContents, existingAttachments);
+					uploadedCount += 1;
+					const replacement = `![${reference.altText}](${url})`;
+					if (replacement !== reference.fullMatch) {
+						confluenceContent = this.replaceNthMatch(confluenceContent, reference.fullMatch, replacement, reference.occurrence);
+					}
+					continue;
+				}
+
+				const file = this.resolveFile(activeFile, reference.attachmentPath);
+				if (!file) {
+					skippedCount += 1;
+					errors.push(`Missing attachment: ${reference.attachmentPath}`);
+					this.appendDebugInfo([`Attachment skipped: ${reference.attachmentPath}`, 'Reason: file could not be resolved']);
+					continue;
+				}
+
+				const candidate = this.buildAttachmentSyncCandidate(activeFile, reference, file);
+				this.appendDebugInfo([
+					`Attachment found: ${file.path}`,
+					`Attachment target: ${candidate.target}`,
+					`Attachment pattern: ${candidate.matchedPattern ?? '(none)'}`,
+					`Attachment object key: ${candidate.objectKey || '(n/a)'}`
+				]);
+
+				if (candidate.target === 'wiki' && !pageId) {
+					throw new Error(`Attachment ${file.name} requires a bound Confluence page before it can sync to wiki.`);
+				}
+
 				const url = candidate.target === 's3'
 					? await this.s3Service.uploadAttachmentToS3(file, candidate.objectKey)
 					: await this.confluenceService.uploadAttachmentAndGetUrl(pageId as string, file, existingAttachments);
 				uploadedCount += 1;
 				const replacement = this.buildAttachmentReplacement(candidate, url);
 				if (replacement === reference.fullMatch) continue;
-				confluenceContent = confluenceContent.replace(reference.fullMatch, replacement);
+				confluenceContent = this.replaceNthMatch(confluenceContent, reference.fullMatch, replacement, reference.occurrence);
 				if (candidate.target === 's3' && this.getSettings().attachmentSync.replaceLinksWhenS3) {
-					localContent = localContent.replace(reference.fullMatch, replacement);
+					localContent = this.replaceNthMatch(localContent, reference.fullMatch, replacement, reference.occurrence);
 					rewrittenCount += 1;
 					if (this.getSettings().attachmentSync.deleteLocalAfterUpload) {
 						deleteCandidates.set(file.path, file);
@@ -101,8 +129,8 @@ export class AttachmentSyncService {
 			} catch (error) {
 				skippedCount += 1;
 				const message = this.formatError(error);
-				errors.push(`Attachment ${file.name}: ${message}`);
-				this.appendDebugInfo([`Attachment upload skipped: ${file.name}`, `Attachment error: ${message}`]);
+				errors.push(`Attachment ${reference.attachmentPath}: ${message}`);
+				this.appendDebugInfo([`Attachment upload skipped: ${reference.attachmentPath}`, `Attachment error: ${message}`]);
 			}
 		}
 
@@ -157,16 +185,64 @@ export class AttachmentSyncService {
 	}
 
 	extractAttachmentReferences(content: string): AttachmentReference[] {
-		return Array.from(content.matchAll(WIKI_ATTACHMENT_REGEX)).map((match) => {
+		const references: AttachmentReference[] = [];
+		const occurrenceCounts = new Map<string, number>();
+
+		for (const match of content.matchAll(WIKI_ATTACHMENT_REGEX)) {
 			const rawTarget = match[1];
 			const segments = rawTarget.split('|').map((item) => item.trim());
 			const attachmentPath = segments[0];
-			return { fullMatch: match[0], rawTarget, attachmentPath, altText: segments.slice(1).join(' ') || attachmentPath };
-		});
+			const fullMatch = match[0];
+			const occurrence = occurrenceCounts.get(fullMatch) ?? 0;
+			occurrenceCounts.set(fullMatch, occurrence + 1);
+			references.push({
+				kind: 'wiki',
+				fullMatch,
+				rawTarget,
+				attachmentPath,
+				altText: segments.slice(1).join(' ') || attachmentPath,
+				index: match.index ?? 0,
+				occurrence
+			});
+		}
+
+		for (const match of content.matchAll(MARKDOWN_IMAGE_REGEX)) {
+			const altText = (match[1] ?? '').trim();
+			const rawTarget = (match[2] ?? '').trim();
+			const fullMatch = match[0];
+			const occurrence = occurrenceCounts.get(fullMatch) ?? 0;
+			occurrenceCounts.set(fullMatch, occurrence + 1);
+			references.push({
+				kind: 'markdown-image',
+				fullMatch,
+				rawTarget,
+				attachmentPath: this.normalizeMarkdownImagePath(rawTarget),
+				altText,
+				index: match.index ?? 0,
+				occurrence
+			});
+		}
+
+		return references.sort((left, right) => left.index - right.index);
 	}
 
 	buildAttachmentReplacement(candidate: AttachmentSyncCandidate, url: string): string {
 		return this.isImageFile(candidate.file) ? `![${candidate.reference.altText}](${url})` : `[${candidate.reference.altText}](${url})`;
+	}
+
+	replaceNthMatch(content: string, target: string, replacement: string, occurrence: number): string {
+		if (occurrence < 0) return content;
+		let fromIndex = 0;
+		let matchIndex = 0;
+		while (true) {
+			const foundAt = content.indexOf(target, fromIndex);
+			if (foundAt === -1) return content;
+			if (matchIndex === occurrence) {
+				return `${content.slice(0, foundAt)}${replacement}${content.slice(foundAt + target.length)}`;
+			}
+			fromIndex = foundAt + target.length;
+			matchIndex += 1;
+		}
 	}
 
 	persistRewrittenNote(activeFile: TFile, content: string): Promise<void> {
@@ -178,7 +254,7 @@ export class AttachmentSyncService {
 	}
 
 	resolveFile(activeFile: TFile, targetPath: string): TFile | null {
-		const normalizedTarget = targetPath.split('#')[0].trim();
+		const normalizedTarget = this.normalizeLocalTargetPath(targetPath);
 		if (!normalizedTarget) return null;
 		const linkedFile = this.app.metadataCache.getFirstLinkpathDest(normalizedTarget, activeFile.path);
 		if (linkedFile instanceof TFile) return linkedFile;
@@ -189,6 +265,74 @@ export class AttachmentSyncService {
 
 	isImageFile(file: TFile): boolean {
 		return IMAGE_EXTENSIONS.has(file.extension.toLowerCase());
+	}
+
+	isRemoteImageReference(reference: AttachmentReference): boolean {
+		return reference.kind === 'markdown-image' && /^https?:\/\//i.test(reference.attachmentPath);
+	}
+
+	normalizeMarkdownImagePath(rawTarget: string): string {
+		const trimmed = rawTarget.trim();
+		const wrapped = trimmed.match(/^<(.+)>$/);
+		const unwrapped = wrapped ? wrapped[1].trim() : trimmed;
+		const titleMatch = unwrapped.match(/^(\S+)(?:\s+["'][^"']*["'])$/);
+		return titleMatch ? titleMatch[1] : unwrapped;
+	}
+
+	normalizeLocalTargetPath(targetPath: string): string {
+		const withoutFragment = targetPath.split('#')[0].trim();
+		const withoutQuery = withoutFragment.split('?')[0].trim();
+		return withoutQuery;
+	}
+
+	async downloadRemoteImage(url: string): Promise<RemoteImageResource> {
+		const response = await requestUrl({ url, method: 'GET' });
+		if (response.status >= 400) {
+			throw new Error(`Remote image download failed. HTTP ${response.status}. URL: ${url}`);
+		}
+		const mimeType = this.normalizeMimeType(response.headers['content-type']);
+		const filename = this.buildRemoteImageFilename(url, mimeType);
+		return {
+			filename,
+			mimeType,
+			binaryContents: response.arrayBuffer
+		};
+	}
+
+	normalizeMimeType(contentTypeHeader: string | string[] | undefined): string {
+		const raw = Array.isArray(contentTypeHeader) ? contentTypeHeader[0] : contentTypeHeader;
+		return raw?.split(';')[0].trim() || 'application/octet-stream';
+	}
+
+	buildRemoteImageFilename(url: string, mimeType: string): string {
+		let pathname = '';
+		try {
+			pathname = new URL(url).pathname;
+		} catch (_error) {
+			pathname = '';
+		}
+		const lastSegment = pathname.split('/').filter(Boolean).pop() ?? '';
+		const decodedName = lastSegment ? decodeURIComponent(lastSegment) : '';
+		const safeName = decodedName.replace(/[\\/:*?"<>|]/g, '-').trim();
+		if (safeName) {
+			if (safeName.includes('.')) return safeName;
+			const extension = this.mimeTypeToExtension(mimeType);
+			return extension ? `${safeName}.${extension}` : safeName;
+		}
+		const extension = this.mimeTypeToExtension(mimeType);
+		return `remote-image-${Date.now()}${extension ? `.${extension}` : ''}`;
+	}
+
+	mimeTypeToExtension(mimeType: string): string {
+		switch (mimeType.toLowerCase()) {
+			case 'image/png': return 'png';
+			case 'image/jpeg': return 'jpg';
+			case 'image/gif': return 'gif';
+			case 'image/bmp': return 'bmp';
+			case 'image/svg+xml': return 'svg';
+			case 'image/webp': return 'webp';
+			default: return '';
+		}
 	}
 
 	normalizeFilePatterns(patterns: string[] | string | undefined): string[] {

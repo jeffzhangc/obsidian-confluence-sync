@@ -253,16 +253,32 @@ export class ConfluenceService {
 			this.appendDebugInfo([`Attachment skipped (already exists): ${file.name} (id: ${existingAttachment.id})`]);
 			return this.getAttachmentUrl(pageId, file.name, existingAttachment);
 		}
-		return this.performUpload(pageId, file, false);
+		const fileContents = await this.app.vault.adapter.readBinary(file.path);
+		return this.uploadBinaryAttachmentAndGetUrl(pageId, file.name, this.getMimeType(file.extension), fileContents, existingAttachments);
 	}
 
-	async performUpload(pageId: string, file: TFile, isUpdate: boolean): Promise<string> {
-		const fileContents = await this.app.vault.adapter.readBinary(file.path);
-		const mimeType = this.getMimeType(file.extension);
-		const multipart = buildMultipartBody(file.name, mimeType, fileContents);
-		const url = isUpdate ? `${this.getConfluenceHost()}/rest/api/content/${pageId}/child/attachment/${encodeURIComponent(file.name)}/data` : `${this.getConfluenceHost()}/rest/api/content/${pageId}/child/attachment`;
+	async uploadBinaryAttachmentAndGetUrl(
+		pageId: string,
+		filename: string,
+		mimeType: string,
+		fileContents: ArrayBuffer,
+		existingAttachments: Map<string, ConfluenceAttachment>
+	): Promise<string> {
+		const existingAttachment = existingAttachments.get(filename);
+		if (existingAttachment) {
+			this.appendDebugInfo([`Attachment skipped (already exists): ${filename} (id: ${existingAttachment.id})`]);
+			return this.getAttachmentUrl(pageId, filename, existingAttachment);
+		}
+		const uploadResult = await this.performUpload(pageId, filename, mimeType, fileContents, false);
+		existingAttachments.set(filename, uploadResult.attachment);
+		return uploadResult.url;
+	}
+
+	async performUpload(pageId: string, filename: string, mimeType: string, fileContents: ArrayBuffer, isUpdate: boolean): Promise<{ url: string; attachment: ConfluenceAttachment }> {
+		const multipart = buildMultipartBody(filename, mimeType, fileContents);
+		const url = isUpdate ? `${this.getConfluenceHost()}/rest/api/content/${pageId}/child/attachment/${encodeURIComponent(filename)}/data` : `${this.getConfluenceHost()}/rest/api/content/${pageId}/child/attachment`;
 		const method = isUpdate ? 'PUT' : 'POST';
-		const action = isUpdate ? `Update attachment ${file.name}` : `Upload attachment ${file.name}`;
+		const action = isUpdate ? `Update attachment ${filename}` : `Upload attachment ${filename}`;
 		this.appendDebugInfo([`Request: ${action} to page ${pageId}`, 'Method: ' + method, `URL: ${url}`]);
 		const response = await sendBinaryRequest({
 			url,
@@ -276,11 +292,20 @@ export class ConfluenceService {
 			},
 			body: multipart.body
 		}, action, this.formatError);
-		const attachmentResponse = JSON.parse(response.text) as { results?: Array<{ _links?: { base?: string; download?: string } }> };
-		const downloadPath = attachmentResponse.results?.[0]?._links?.download;
-		const downloadBase = attachmentResponse.results?.[0]?._links?.base ?? this.getConfluenceHost();
-		if (downloadPath) return `${downloadBase}${downloadPath}`;
-		return `${this.getConfluenceHost()}/download/attachments/${pageId}/${encodeURIComponent(file.name)}`;
+		const attachmentResponse = JSON.parse(response.text) as { results?: Array<{ id: string; title: string; version?: { number: number }; _links?: { base?: string; download?: string } }> };
+		const result = attachmentResponse.results?.[0];
+		const attachment: ConfluenceAttachment = {
+			id: result?.id ?? '',
+			title: result?.title ?? filename,
+			version: result?.version,
+			_links: result?._links
+		};
+		const downloadPath = result?._links?.download;
+		const downloadBase = result?._links?.base ?? this.getConfluenceHost();
+		return {
+			url: downloadPath ? `${downloadBase}${downloadPath}` : `${this.getConfluenceHost()}/download/attachments/${pageId}/${encodeURIComponent(filename)}`,
+			attachment
+		};
 	}
 
 	getAttachmentUrl(pageId: string, filename: string, attachment: ConfluenceAttachment): string {
