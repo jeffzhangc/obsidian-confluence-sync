@@ -140,7 +140,7 @@ export default class ObsidianConfluenceSync extends Plugin {
 			const attachmentRun = await this.attachmentSyncService.runAttachmentSync(activeFile, rawContent, page.id, true);
 			const sanitizedContent = this.stripFrontmatter(attachmentRun.confluenceContent);
 			new Notice('Syncing to Confluence...');
-			const syncedPage = await this.confluenceService.syncContentsToConfluence(page.id, sanitizedContent, activeFile.basename);
+			const syncedPage = await this.confluenceService.syncContentsToConfluence(page.id, sanitizedContent);
 			await this.confluenceService.updateNoteProperties(activeFile, syncedPage, this.settings);
 			this.setLastSyncDebugInfo([
 				'Status: success',

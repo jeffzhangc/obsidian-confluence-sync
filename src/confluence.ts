@@ -105,7 +105,7 @@ export class ConfluenceService {
 		return this.getContentByTitle(spaceKey, title);
 	}
 
-	async syncContentsToConfluence(confluencePageId: string, activeFileData: string, title: string): Promise<ConfluencePage> {
+	async syncContentsToConfluence(confluencePageId: string, activeFileData: string): Promise<ConfluencePage> {
 		const pageContent = await this.getContentFromConfluence(confluencePageId);
 		const response = await this.requestConfluence({
 			url: `${this.getConfluenceHost()}/rest/api/content/${confluencePageId}`,
@@ -114,7 +114,7 @@ export class ConfluenceService {
 			body: JSON.stringify({
 				version: { number: (pageContent.version?.number ?? 0) + 1 },
 				type: pageContent.type,
-				title,
+				title: pageContent.title,
 				body: { storage: { value: this.createPageBody(activeFileData), representation: 'storage' } }
 			})
 		}, `Update Confluence page ${confluencePageId}`);
